@@ -7,7 +7,7 @@ import lightning as L
 from lightning.pytorch.callbacks import EarlyStopping
 from torchmetrics.segmentation import MeanIoU
 
-from lightning_modules import CloudDataModule, CloudDataset, DummyModel
+from lightning_modules import CloudDataModule, CloudDataset, DummyModel, CloudUNet
 
 def main(args):
     print('Starting script')
@@ -15,7 +15,7 @@ def main(args):
 
     # cloud_types = ['Fish', 'Flower', 'Gravel', 'Sugar']
     cloud_types = ['Fish']
-    batch_size = 16
+    batch_size = 4
 
     num_masks = len(cloud_types)
 
@@ -27,11 +27,13 @@ def main(args):
     test_dataloader = cdm.test_dataloader()
     print('Finished data setup')
 
-    model = DummyModel(num_masks=num_masks)
+    #model = DummyModel(num_masks=num_masks)
+    model = CloudUNet()
     print('Finished model setup')
 
     trainer = L.Trainer(max_epochs=1, 
-                        fast_dev_run=False,
+                        fast_dev_run=True,
+                        devices=1,
                         callbacks=EarlyStopping('valid_loss', mode='min'), 
                         num_sanity_val_steps=2,)
     print('Starting training')

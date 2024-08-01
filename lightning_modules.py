@@ -218,3 +218,116 @@ class DummyModel(L.LightningModule):
         target_flat = target.view(-1)
         intersection = (pred_flat * target_flat).sum()
         return 1 - ((2. * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth))
+
+class CloudUNet(L.LightningModule):
+    '''
+    U-Net for cloud segmentation
+    '''
+    def __init__(self, num_classes=2):
+        super().__init__()
+
+        # architecture blocks
+        self.max_pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # contracting
+        self.down_conv1 = self.double_conv_block(3, 64)
+        self.down_conv2 = self.double_conv_block(64, 128)
+        self.down_conv3 = self.double_conv_block(128, 256)
+        self.down_conv4 = self.double_conv_block(256, 512)
+        self.down_conv5 = self.double_conv_block(512, 1024)
+
+        # expanding
+        self.up_transp5 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
+        self.up_conv5 = self.double_conv_block(1024, 1024)
+        self.up_transp4 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.up_conv4 = self.double_conv_block(512, 512)
+        self.up_transp3 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.up_conv3 = self.double_conv_block(256, 128)
+        self.up_transp2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.up_conv2 = self.double_conv_block(128, 64)
+
+        # output layer
+        self.out = nn.Conv2d(64, num_classes, kernel_size=1)
+
+    def forward(self, img):
+        # contracting path
+        down1 = self.down_conv1(img)
+        x = self.max_pool(down1)
+        down2 = self.down_conv2(x)
+        x = self.max_pool(down2)
+        down3 = self.down_conv3(x)
+        x = self.max_pool(down3)
+        down4 = self.down_conv4(x)
+        x = self.max_pool(down4)
+        down5 = self.down_conv5(x)
+        print(down5.shape, x.shape)
+
+        # expanding path
+        x = self.up_transp5(down5)
+        print(x.shape)
+        x = self.up_conv5(torch.cat((down5, x), dim=1))
+
+        x = self.up_transp4(x)
+        x = self.up_conv4(torch.cat((down4, x), dim=1))
+
+
+        x = self.up_transp3(x)
+        print(x.shape, down3.shape)
+        x = torch.cat((down3, x), dim=1)
+        x = self.up_conv3(x)
+        print('here')
+
+        up2 = self.up_transp2(x)
+        print('here')
+        up2 = self.up_conv2(torch.cat([down1, up2]), 1)
+        print('here')
+
+        return self.out(up2)
+    
+    def training_step(self, batch, batch_idx):
+        img, mask = batch
+        pred_mask = self.forward(img)
+        dice_loss = self.dice_loss(mask, pred_mask)
+        return dice_loss
+
+    def validation_step(self, batch, batch_idx):
+        img, mask = batch
+        pred_mask = self.forward(img)
+        dice_loss = self.dice_loss(mask, pred_mask)
+
+        self.log("valid_loss", dice_loss, on_epoch=True, sync_dist=True)
+
+    def test_step(self, batch, batch_idx):
+        img, mask = batch
+        pred_mask = self.forward(img)
+
+        print(pred_mask.shape)
+        
+        enc_pred_mask = CloudDataset.mask_to_rle(pred_mask.cpu().numpy())
+        return enc_pred_mask
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters())
+
+    @staticmethod
+    def double_conv_block(in_channels, out_channels):
+        '''
+        Creates a double convolution block in UNet
+
+        Arguments:
+        in_channels (int): number of input channels
+        out_channels (int): number of output channels
+
+        Returns:
+        torch.nn.Sequential
+        '''
+        block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        return block
