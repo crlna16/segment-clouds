@@ -31,7 +31,7 @@ class CloudDataset(Dataset):
         '''
         super().__init__()
 
-        if split == 'train' or split == 'valid':
+        if split in ['train', 'valid', 'dev']:
             path_to_data = './data/train_images'
         elif split == 'test':
             path_to_data = './data/test_images'
@@ -42,6 +42,14 @@ class CloudDataset(Dataset):
 
         # split train/val externally
         self.labels = pd.read_csv(f'./data/split_{split}.csv', dtype='object')
+
+        # for single-mask models, remove samples that do not contain them
+        if split != 'test' and len(self.cloud_types) == 1:
+            self.labels = self.labels[self.labels['class_name'] == self.cloud_types[0]]
+            self.labels = self.labels[self.labels['EncodedPixels'] != '-1']
+
+        print(f'Samples in {split} after filter: {len(self.labels)}')
+
         self.img_files = [os.path.join(path_to_data, ff) for ff in self.labels['filename']]
 
         # define data augmentation
@@ -94,10 +102,28 @@ class CloudDataset(Dataset):
             img = np.zeros(rows*cols,dtype=np.uint8)
             for index,length in rlePairs:
                 index -= 1
-                img[index:index+length] = 255
+                img[index:index+length] = 1
             img = img.reshape(cols,rows)
             img = img.T
             return torch.from_numpy(img)
+
+    @staticmethod
+    def mask_to_rle(img):
+        '''
+        img: numpy array, 1 - mask, 0 - background
+        Returns run length as string formated
+        '''
+        img = img.cpu().numpy()
+        pixels= np.round(img.T.flatten()).astype(int)
+        if np.all(np.allclose(pixels, 0)):
+            return '-1' # for compatibility
+        pixels = np.concatenate([[0], pixels, [0]])
+        runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+        
+        if len(runs) % 2 == 1:
+            runs = runs[:-1]
+        runs[1::2] -= runs[::2]
+        return ' '.join(str(x) for x in runs)
 
 # Datamodule
 class CloudDataModule(L.LightningDataModule):
@@ -106,15 +132,20 @@ class CloudDataModule(L.LightningDataModule):
 
     Assigns
     cloud_types (List[str]): list of cloud types that are predicted
+    is_dev_mode (bool): If True, predict on dev set. Else generate test set submission
+    batch_size (int): batch size
+    num_workers (int): dataloader workers
     '''
     def __init__(self, 
                  cloud_types=['Fish', 'Flower', 'Gravel', 'Sugar'],
-                 batch_size=8,
+                 is_dev_mode=True,
+                 batch_size=4,
                  num_workers=8
                  ):
         super().__init__()
 
         self.cloud_types = cloud_types
+        self.is_dev_mode = is_dev_mode
         self.batch_size = batch_size
         self.num_workers = num_workers
 
@@ -124,6 +155,7 @@ class CloudDataModule(L.LightningDataModule):
     def setup(self):
         self.train_data = CloudDataset(split='train', cloud_types=self.cloud_types)
         self.valid_data = CloudDataset(split='valid', cloud_types=self.cloud_types)
+        self.dev_data = CloudDataset(split='dev', cloud_types=self.cloud_types)
         self.test_data = CloudDataset(split='test', cloud_types=self.cloud_types)
 
     def train_dataloader(self):
@@ -133,19 +165,24 @@ class CloudDataModule(L.LightningDataModule):
         return DataLoader(self.valid_data, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False)
 
     def test_dataloader(self):
-        return DataLoader(self.test_data, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False)
+        if self.is_dev_mode:
+            return DataLoader(self.dev_data, batch_size=1, num_workers=self.num_workers, shuffle=False)
+        else:
+            return DataLoader(self.test_data, batch_size=1, num_workers=self.num_workers, shuffle=False)
+
 
 # Model architecture
 class DummyModel(L.LightningModule):
-    def __init__(self):
+    def __init__(self, num_masks=4):
         super().__init__()
 
-        self.conv = nn.Conv2d(in_channels=3, out_channels=4, kernel_size=3, padding=1)
+        self.conv = nn.Conv2d(in_channels=3, out_channels=num_masks, kernel_size=3, padding=1)
 
-        self.model = self.conv
+        self.model = nn.Sequential(self.conv)
 
     def forward(self, img):
-        mask = self.conv(img)
+        mask = self.model(img)
+        mask = F.sigmoid(mask)
         return mask
 
     def training_step(self, batch, batch_idx):
@@ -161,6 +198,14 @@ class DummyModel(L.LightningModule):
 
         self.log("valid_loss", dice_loss, on_epoch=True, sync_dist=True)
 
+    def test_step(self, batch, batch_idx):
+        img, mask = batch
+        pred_mask = self.forward(img)
+
+        print(pred_mask.shape)
+        
+        enc_pred_mask = CloudDataset.mask_to_rle(pred_mask.cpu().numpy())
+        return enc_pred_mask
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.model.parameters())
