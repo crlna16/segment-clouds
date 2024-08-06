@@ -3,9 +3,10 @@ import time
 import pandas as pd
 
 import torch
+import torch.nn.functional as F
 import lightning as L
 from lightning.pytorch.callbacks import EarlyStopping
-from torchmetrics.segmentation import MeanIoU
+from torchmetrics.segmentation import MeanIoU # type: ignore
 
 from lightning_modules import CloudDataModule, CloudDataset, DummyModel, CloudUNet
 
@@ -15,11 +16,12 @@ def main(args):
 
     # cloud_types = ['Fish', 'Flower', 'Gravel', 'Sugar']
     cloud_types = ['Fish']
-    batch_size = 4
+    batch_size = 2
+    downscale = True
 
     num_masks = len(cloud_types)
 
-    cdm = CloudDataModule(cloud_types=cloud_types, batch_size=batch_size)
+    cdm = CloudDataModule(cloud_types=cloud_types, batch_size=batch_size, downscale=downscale)
     cdm.setup()
 
     train_dataloader = cdm.train_dataloader()
@@ -31,11 +33,12 @@ def main(args):
     model = CloudUNet()
     print('Finished model setup')
 
-    trainer = L.Trainer(max_epochs=1, 
-                        fast_dev_run=True,
-                        devices=1,
-                        callbacks=EarlyStopping('valid_loss', mode='min'), 
-                        num_sanity_val_steps=2,)
+    trainer = L.Trainer(max_epochs=50, 
+                        enable_progress_bar=False,
+                        fast_dev_run=False,
+                        devices='auto',
+                        callbacks=EarlyStopping('valid_loss', mode='min', patience=3), 
+                        num_sanity_val_steps=1,)
     print('Starting training')
     trainer.fit(model=model, 
                 train_dataloaders=train_dataloader, 
@@ -48,7 +51,14 @@ def main(args):
     idx = []
     metric = MeanIoU(num_classes=3)
     for i, (img, mask) in enumerate(test_dataloader):
-        pred_mask = torch.round(model(img)).squeeze(dim=1).type(torch.int)
+        #pred_mask = torch.round(model(img)).squeeze(dim=1).type(torch.LongTensor)
+        pred_mask = model(img)
+        pred_mask = F.softmax(pred_mask, dim=1)
+        pred_mask = torch.argmax(pred_mask, dim=1).type(torch.LongTensor)
+
+        #mask = torch.argmax(F.softmax(mask, dim=1), dim=1).type(torch.LongTensor)
+        mask = mask.sum(dim=1)
+
         metrics.append(metric(pred_mask, mask).cpu().numpy())
         enc = CloudDataset.mask_to_rle(pred_mask)
 

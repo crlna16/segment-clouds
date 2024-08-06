@@ -24,10 +24,12 @@ class CloudDataset(Dataset):
     mask (Dict): dictionary of masks for each class: fish, flower, gravel, sugar
 
     '''
-    def __init__(self, split='train', cloud_types=['Fish', 'Flower', 'Gravel', 'Sugar']):
+    def __init__(self, split='train', cloud_types=['Fish', 'Flower', 'Gravel', 'Sugar'], downscale=False):
         '''
         Arguments:
         split (str): train, valid, or test set. Defaults to train.
+        cloud_types (List): which cloud types to use for segmentation
+        downscale (bool): If True, downscale images for faster training (default: False)
         '''
         super().__init__()
 
@@ -57,6 +59,12 @@ class CloudDataset(Dataset):
             [v2.ToImage(), v2.ToDtype(torch.float32, scale=True),]
         )
 
+        # define downscale operation
+        self.downscale = downscale
+        if self.downscale:
+            #self.downscale_trafo = v2.Resize((350, 525))
+            self.downscale_trafo = v2.Resize((1392, 2096))
+
     def __len__(self):
         '''Return length of the dataset'''
         return len(self.img_files)
@@ -75,8 +83,16 @@ class CloudDataset(Dataset):
             mask[cloud] = self.rle_to_mask(enc, height=1400, width=2100)
 
         mask_tensor = torch.stack(list(mask.values())).squeeze()
+        if self.downscale:
+            img_tensor = self.downscale_trafo(img_tensor.unsqueeze(0)).squeeze()
+            mask_tensor = self.downscale_trafo(mask_tensor.unsqueeze(0)).squeeze()
 
-        return img_tensor, mask_tensor.type(torch.LongTensor)
+        mask_tensor = mask_tensor.type(torch.LongTensor)
+        if len(self.cloud_types) == 1:
+            mask_tensor = F.one_hot(mask_tensor, num_classes=2)
+            mask_tensor = mask_tensor.permute(2, 0, 1)
+
+        return img_tensor, mask_tensor
 
     # Utility functions
     # from https://www.kaggle.com/robertkag/rle-to-mask-converter
@@ -134,12 +150,14 @@ class CloudDataModule(L.LightningDataModule):
     cloud_types (List[str]): list of cloud types that are predicted
     is_dev_mode (bool): If True, predict on dev set. Else generate test set submission
     batch_size (int): batch size
+    downscale (bool): Passed to Dataset
     num_workers (int): dataloader workers
     '''
     def __init__(self, 
                  cloud_types=['Fish', 'Flower', 'Gravel', 'Sugar'],
                  is_dev_mode=True,
                  batch_size=4,
+                 downscale=False,
                  num_workers=8
                  ):
         super().__init__()
@@ -147,16 +165,17 @@ class CloudDataModule(L.LightningDataModule):
         self.cloud_types = cloud_types
         self.is_dev_mode = is_dev_mode
         self.batch_size = batch_size
+        self.downscale = downscale
         self.num_workers = num_workers
 
     def prepare_data(self):
         pass
 
     def setup(self):
-        self.train_data = CloudDataset(split='train', cloud_types=self.cloud_types)
-        self.valid_data = CloudDataset(split='valid', cloud_types=self.cloud_types)
-        self.dev_data = CloudDataset(split='dev', cloud_types=self.cloud_types)
-        self.test_data = CloudDataset(split='test', cloud_types=self.cloud_types)
+        self.train_data = CloudDataset(split='train', cloud_types=self.cloud_types, downscale=self.downscale)
+        self.valid_data = CloudDataset(split='valid', cloud_types=self.cloud_types, downscale=self.downscale)
+        self.dev_data = CloudDataset(split='dev', cloud_types=self.cloud_types, downscale=self.downscale)
+        self.test_data = CloudDataset(split='test', cloud_types=self.cloud_types, downscale=self.downscale)
 
     def train_dataloader(self):
         return DataLoader(self.train_data, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True)
@@ -188,13 +207,13 @@ class DummyModel(L.LightningModule):
     def training_step(self, batch, batch_idx):
         img, mask = batch
         pred_mask = self.forward(img)
-        dice_loss = self.dice_loss(mask, pred_mask)
+        dice_loss = self.dice_loss(pred_mask, mask)
         return dice_loss
 
     def validation_step(self, batch, batch_idx):
         img, mask = batch
         pred_mask = self.forward(img)
-        dice_loss = self.dice_loss(mask, pred_mask)
+        dice_loss = self.dice_loss(pred_mask, mask)
 
         self.log("valid_loss", dice_loss, on_epoch=True, sync_dist=True)
 
@@ -202,8 +221,6 @@ class DummyModel(L.LightningModule):
         img, mask = batch
         pred_mask = self.forward(img)
 
-        print(pred_mask.shape)
-        
         enc_pred_mask = CloudDataset.mask_to_rle(pred_mask.cpu().numpy())
         return enc_pred_mask
 
@@ -238,9 +255,9 @@ class CloudUNet(L.LightningModule):
 
         # expanding
         self.up_transp5 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
-        self.up_conv5 = self.double_conv_block(1024, 1024)
+        self.up_conv5 = self.double_conv_block(1024, 512)
         self.up_transp4 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
-        self.up_conv4 = self.double_conv_block(512, 512)
+        self.up_conv4 = self.double_conv_block(512, 256)
         self.up_transp3 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
         self.up_conv3 = self.double_conv_block(256, 128)
         self.up_transp2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
@@ -260,40 +277,38 @@ class CloudUNet(L.LightningModule):
         down4 = self.down_conv4(x)
         x = self.max_pool(down4)
         down5 = self.down_conv5(x)
-        print(down5.shape, x.shape)
 
         # expanding path
         x = self.up_transp5(down5)
-        print(x.shape)
-        x = self.up_conv5(torch.cat((down5, x), dim=1))
+        down4 = down4[:, :, :x.shape[2], :x.shape[3]]
+        x = self.up_conv5(torch.cat((down4, x), dim=1))
 
         x = self.up_transp4(x)
-        x = self.up_conv4(torch.cat((down4, x), dim=1))
-
+        down3 = down3[:, :, :x.shape[2], :x.shape[3]]
+        x = self.up_conv4(torch.cat((down3, x), dim=1))
 
         x = self.up_transp3(x)
-        print(x.shape, down3.shape)
-        x = torch.cat((down3, x), dim=1)
+        down2 = down2[:, :, :x.shape[2], :x.shape[3]]
+        x = torch.cat((down2, x), dim=1)
         x = self.up_conv3(x)
-        print('here')
 
-        up2 = self.up_transp2(x)
-        print('here')
-        up2 = self.up_conv2(torch.cat([down1, up2]), 1)
-        print('here')
+        x = self.up_transp2(x)
+        down1 = down1[:, :, :x.shape[2], :x.shape[3]]
+        x = torch.cat((down1, x), dim=1)
+        x = self.up_conv2(x)
 
-        return self.out(up2)
+        return self.out(x)
     
     def training_step(self, batch, batch_idx):
         img, mask = batch
         pred_mask = self.forward(img)
-        dice_loss = self.dice_loss(mask, pred_mask)
+        dice_loss = self.dice_loss(pred_mask, mask)
         return dice_loss
 
     def validation_step(self, batch, batch_idx):
         img, mask = batch
         pred_mask = self.forward(img)
-        dice_loss = self.dice_loss(mask, pred_mask)
+        dice_loss = self.dice_loss(pred_mask, mask)
 
         self.log("valid_loss", dice_loss, on_epoch=True, sync_dist=True)
 
@@ -301,8 +316,9 @@ class CloudUNet(L.LightningModule):
         img, mask = batch
         pred_mask = self.forward(img)
 
-        print(pred_mask.shape)
-        
+        pred_mask = F.softmax(pred_mask, dim=1)
+        pred_mask = torch.argmax(pred_mask)
+
         enc_pred_mask = CloudDataset.mask_to_rle(pred_mask.cpu().numpy())
         return enc_pred_mask
 
@@ -331,3 +347,11 @@ class CloudUNet(L.LightningModule):
         )
 
         return block
+
+    @staticmethod
+    def dice_loss(pred, target, smooth = 1.):
+        pred = torch.sigmoid(pred)
+        pred_flat = pred.view(-1)
+        target_flat = target.view(-1)
+        intersection = (pred_flat * target_flat).sum()
+        return 1 - ((2. * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth))
