@@ -8,7 +8,9 @@ import lightning as L
 from lightning.pytorch.callbacks import EarlyStopping
 from torchmetrics.segmentation import MeanIoU # type: ignore
 
-from lightning_modules import CloudDataModule, CloudDataset, DummyModel, CloudUNet
+from cloud_data import CloudDataModule
+from models import UNet
+import utils
 
 def main(args):
     print('Starting script')
@@ -29,13 +31,12 @@ def main(args):
     test_dataloader = cdm.test_dataloader()
     print('Finished data setup')
 
-    #model = DummyModel(num_masks=num_masks)
-    model = CloudUNet()
+    model = UNet()
     print('Finished model setup')
 
     trainer = L.Trainer(max_epochs=50, 
                         enable_progress_bar=False,
-                        fast_dev_run=False,
+                        fast_dev_run=True,
                         devices='auto',
                         callbacks=EarlyStopping('valid_loss', mode='min', patience=3), 
                         num_sanity_val_steps=1,)
@@ -60,7 +61,7 @@ def main(args):
         mask = mask.sum(dim=1)
 
         metrics.append(metric(pred_mask, mask).cpu().numpy())
-        enc = CloudDataset.mask_to_rle(pred_mask)
+        enc = utils.mask_to_rle(pred_mask)
 
         idx.append(i)
         encs.append(enc)
